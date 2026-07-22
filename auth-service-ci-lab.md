@@ -195,6 +195,8 @@ spec:
       namespace: dev
     - server: https://kubernetes.default.svc
       namespace: qa
+    - server: https://kubernetes.default.svc
+      namespace: prod
   clusterResourceWhitelist:
     - group: "*"
       kind: "*"
@@ -286,6 +288,15 @@ EOF
 ### Step 4 — Set up External Secrets
 
 Wires up AWS Secrets Manager → Kubernetes Secrets (`db-credentials`, `jwt-secret`) in the `dev` namespace via IRSA. The IAM role `pharma-dev-eso-role` is created by Terraform in Stage 1 — no static AWS keys are stored in the cluster.
+
+**Why External Secrets Operator instead of native Kubernetes Secrets:**
+
+- **Single source of truth** — the real secret value lives in AWS Secrets Manager, not in the cluster or in git. Kubernetes Secrets alone have no upstream source; whoever last ran `kubectl apply` (or whatever's checked into git) is the source of truth, which invites drift and stale values.
+- **No static credentials in the cluster** — ESO authenticates to AWS via IRSA (the `pharma-dev-eso-role` IAM role), so no long-lived AWS access keys are stored as Kubernetes Secrets or env vars. Native Kubernetes Secrets have no equivalent mechanism for pulling from an external provider.
+- **Automatic rotation** — ESO re-fetches from AWS Secrets Manager on a `refreshInterval` (1h in this lab) and updates the Kubernetes Secret in place. Rotate the value in Secrets Manager and it propagates without a manual `kubectl apply` or a redeploy.
+- **Centralized audit trail** — every read of a secret value goes through AWS Secrets Manager, which is logged in CloudTrail. Kubernetes Secrets are only base64-encoded and give no equivalent access log for who read what, when.
+- **Consistent across environments** — dev, qa, and prod all sync from the same AWS Secrets Manager paths through the same ClusterSecretStore mechanism, so promoting a change is a Secrets Manager update, not a per-namespace `kubectl` command.
+- **Kubernetes-native consumption stays the same** — Pods still mount the result as an ordinary Kubernetes Secret, so no application code changes; ESO only replaces how that Secret's contents get populated and kept fresh.
 
 #### 4.1 — Set variables
 
@@ -638,14 +649,7 @@ Both Kubernetes Secrets must be `Ready` before the student reaches Part 10.
 
 Prod uses **manual sync** — ArgoCD detects drift but will not auto-apply. A human must approve via the CLI or UI before any change lands in production.
 
-Add the `prod` namespace to the AppProject destinations first:
-
-```bash
-kubectl patch appproject pharma -n argocd --type=json \
-  -p='[{"op":"add","path":"/spec/destinations/-","value":{"server":"https://kubernetes.default.svc","namespace":"prod"}}]'
-```
-
-Then create the application:
+The `prod` namespace is already in the AppProject destinations (Step 2), so create the application directly:
 
 ```bash
 kubectl apply -f - <<'EOF'
@@ -1387,7 +1391,7 @@ CI never talks to Kubernetes. CI talks to git. Kubernetes gets its orders from g
 | ArgoCD shows `OutOfSync` but not healing | `selfHeal` not enabled | Run `argocd app set auth-service-dev --self-heal` |
 | ArgoCD app still pointing at `DPP-2026/zen-gitops-lab1` | App repoURL not updated to your fork | Notify instructor — the app needs to be re-pointed to `https://github.com/<YOUR-USERNAME>/zen-gitops-lab1.git` |
 | `argocd: command not found` | argocd CLI not installed | `brew install argocd` (Mac) or see https://argo-cd.readthedocs.io/en/stable/cli_installation/ |
-| QA pod stuck in `CrashLoopBackOff` | Wrong `DB_HOST` in QA values file | `kubectl logs -n qa deploy/auth-service` — confirm `DB_HOST` in `envs/qa/values-auth-service.yaml` matches the dev RDS endpoint (all environments share the same DB) |
+| QA pod stuck in `CrashLoopBackOff` | Wrong `DB_HOST` in QA values file | `kubectl logs -n qa deploy/auth-service` — confirm `DB_HOST` in `envs/qa/values-auth-service.yaml` matches the dev RDS endpoint (all environments share the same DB). If it's stale, fix it: `cd zen-gitops-lab1 && yq e '.configmap.DB_HOST = "<CURRENT_DEV_RDS_ENDPOINT>"' -i envs/qa/values-auth-service.yaml && git add envs/qa/values-auth-service.yaml && git commit -m "fix(auth-service): correct QA DB_HOST" && git push origin main` — ArgoCD auto-syncs QA within ~3 minutes, or force it with `argocd app sync auth-service-qa` |
 | `auth-service-qa` stays `OutOfSync` after merging QA PR | ArgoCD app repoURL still points at DPP-2026 org | Notify instructor — the QA app needs to point at your fork |
 | `Promote to Prod` workflow skips the approval gate | `production` environment not configured in your fork | Create the environment under **Settings → Environments** and add a required reviewer (Part 8.2) |
 | `Promote to Prod` workflow fails: `image not found in ECR` | The develop CI run did not complete successfully | Check the `ci-auth-service.yml` run on your develop branch; the image must exist before prod promotion |
